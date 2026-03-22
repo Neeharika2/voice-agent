@@ -1,0 +1,17 @@
+vosk
+sounddevice
+soundfile
+edge-tts
+numpy<2.0.0
+requests>=2.32.2
+google-generativeai
+TTS==0.22.0
+opencv-python
+deepface
+tf-keras
+transformers==4.39.3
+torch==2.10.0
+torchaudio==2.10.0
+torchvision==0.25.0
+python-dotenv
+tqdm

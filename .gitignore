@@ -41,5 +41,6 @@ Thumbs.db
 
 # Local speech models and generated artifacts
 model/
+models/
 *.wav
 *.mp3

@@ -1,27 +1,34 @@
-"""
-Production TTS module with dual backend (Piper local + Edge cloud) and
-concurrent synthesis maintaining sentence order.
-"""
+"""Piper-only TTS module with ordered streaming playback and emotion control."""
 
-import asyncio
-import io
 import os
 import queue
-import shutil
-import subprocess
-import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
-import edge_tts
 import numpy as np
 import sounddevice as sd
-import soundfile as sf
+from piper import PiperVoice
+from piper.config import SynthesisConfig
 
 import config
+
+
+# Emotion presets: maps emotion name -> synthesis parameters
+# length_scale: higher = slower (good for sad/calm)
+# noise_scale: higher = more variation (good for happy/excited)
+# noise_w_scale: phoneme variation
+EMOTION_PRESETS = {
+    "neutral": SynthesisConfig(length_scale=1.0, noise_scale=0.667, noise_w_scale=0.8),
+    "happy": SynthesisConfig(length_scale=0.95, noise_scale=0.8, noise_w_scale=0.9),
+    "sad": SynthesisConfig(length_scale=1.2, noise_scale=0.5, noise_w_scale=0.6),
+    "calm": SynthesisConfig(length_scale=1.15, noise_scale=0.5, noise_w_scale=0.7),
+    "excited": SynthesisConfig(length_scale=0.9, noise_scale=0.9, noise_w_scale=1.0),
+    "serious": SynthesisConfig(length_scale=1.0, noise_scale=0.4, noise_w_scale=0.5),
+    "whisper": SynthesisConfig(length_scale=1.3, noise_scale=0.3, noise_w_scale=0.4),
+    "curious": SynthesisConfig(length_scale=1.05, noise_scale=0.75, noise_w_scale=0.85),
+}
 
 
 @dataclass(order=True)
@@ -34,100 +41,102 @@ class OrderedChunk:
     text: str = field(default="", compare=False)
     error: Optional[str] = field(default=None, compare=False)
     synth_ms: float = field(default=0.0, compare=False)
-    backend: str = field(default="", compare=False)
+    backend: str = field(default="piper", compare=False)
+    emotion: str = field(default="neutral", compare=False)
 
 
 END_SENTINEL = OrderedChunk(sequence=999999)
 
 
 class TTS:
-    """
-    Dual-backend TTS with concurrent synthesis and ordered playback.
-
-    Modes:
-    - fast/auto: prefer local Piper, fallback to Edge cloud
-    - local: local Piper only (unless fallback enabled)
-    - quality/cloud: Edge cloud only
-    """
+    """Piper TTS engine with queued synthesis and ordered playback."""
 
     def __init__(self):
-        self.voice = getattr(config, "EDGE_TTS_VOICE", "en-IN-NeerjaNeural")
-        self.mode = str(getattr(config, "TTS_MODE", "fast")).strip().lower()
-        self.local_enabled = bool(getattr(config, "TTS_LOCAL_ENABLED", True))
-        self.cloud_enabled = bool(getattr(config, "TTS_CLOUD_ENABLED", True))
-        self.fallback_to_cloud = bool(getattr(config, "TTS_FALLBACK_TO_CLOUD", True))
         self.synth_timeout_s = float(getattr(config, "TTS_SYNTH_TIMEOUT_S", 20.0))
-
-        self.piper_executable = getattr(config, "PIPER_EXECUTABLE", "piper")
-        self.piper_model = getattr(config, "PIPER_MODEL_PATH", None)
-        self.piper_config = getattr(config, "PIPER_MODEL_CONFIG_PATH", None)
-        self._piper_available = self._detect_piper()
-
-        self._num_workers = int(getattr(config, "TTS_PARALLEL_WORKERS", 3))
         self._latency_logs = bool(getattr(config, "LATENCY_LOGS", True))
+
+        self.piper_warmup_text = str(getattr(config, "PIPER_WARMUP_TEXT", "hi")).strip() or "hi"
+
+        self.voice, self.model_path, self.config_path = self._load_voice()
 
         self._audio_queue: queue.PriorityQueue = queue.PriorityQueue()
         self._text_queue: queue.Queue = queue.Queue()
 
         self._next_sequence = 0
         self._lock = threading.Lock()
+        self._last_queued_text = ""
 
         self._stop = threading.Event()
         self._synth_thread = None
         self._player_thread = None
 
-        self._loop = None
-
         self._stream_stats = {}
         self._stats_lock = threading.Lock()
 
-        print(
-            f"TTS: mode={self.mode} backend={self._describe_mode()} voice={self.voice} "
-            f"(workers: {self._num_workers})"
-        )
+        # Allow config to override emotion presets
+        self._load_emotion_presets()
 
-    def _detect_piper(self):
-        if not self.local_enabled:
-            return False
-        if not self.piper_model:
-            return False
+        print(f"TTS: backend=piper model={self.model_path}")
+        self._warmup()
 
-        exe = self.piper_executable
-        resolved = shutil.which(exe) if not os.path.isabs(exe) else exe
-        if not resolved or not os.path.exists(resolved):
-            return False
-        if not os.path.exists(self.piper_model):
-            return False
-        if self.piper_config and not os.path.exists(self.piper_config):
-            return False
+    def _load_emotion_presets(self):
+        """Load custom emotion presets from config if provided."""
+        custom = getattr(config, "EMOTION_PRESETS", None)
+        if custom and isinstance(custom, dict):
+            for emotion, params in custom.items():
+                if isinstance(params, dict):
+                    EMOTION_PRESETS[emotion] = SynthesisConfig(
+                        length_scale=params.get("length_scale", 1.0),
+                        noise_scale=params.get("noise_scale", 0.667),
+                        noise_w_scale=params.get("noise_w_scale", 0.8),
+                    )
 
-        self.piper_executable = resolved
-        return True
+    @staticmethod
+    def get_available_emotions():
+        """Return list of available emotion presets."""
+        return list(EMOTION_PRESETS.keys())
 
-    def _describe_mode(self):
-        if self.mode in ("quality", "cloud"):
-            return "edge"
-        if self.mode == "local":
-            return "piper" if self._piper_available else "none"
-        if self._piper_available:
-            return "piper->edge-fallback"
-        return "edge" if self.cloud_enabled else "none"
+    def _existing(self, value):
+        return bool(value) and os.path.exists(value)
 
-    def _choose_backend(self):
-        if self.mode in ("quality", "cloud"):
-            return "edge" if self.cloud_enabled else "none"
+    def _load_voice(self):
+        primary_model = getattr(config, "PIPER_PRIMARY_MODEL_PATH", None)
+        primary_config = getattr(config, "PIPER_PRIMARY_CONFIG_PATH", None)
+        fallback_model = getattr(config, "PIPER_FALLBACK_MODEL_PATH", None)
+        fallback_config = getattr(config, "PIPER_FALLBACK_CONFIG_PATH", None)
 
-        if self.mode == "local":
-            if self._piper_available:
-                return "piper"
-            if self.fallback_to_cloud and self.cloud_enabled:
-                return "edge"
-            return "none"
+        # Backward compatibility with older config names.
+        legacy_model = getattr(config, "PIPER_MODEL_PATH", None)
+        legacy_config = getattr(config, "PIPER_MODEL_CONFIG_PATH", None)
 
-        # fast / auto / default
-        if self._piper_available:
-            return "piper"
-        return "edge" if self.cloud_enabled else "none"
+        candidates = [
+            (primary_model, primary_config),
+            (legacy_model, legacy_config),
+            (fallback_model, fallback_config),
+        ]
+
+        chosen_model = None
+        chosen_config = None
+        for model_path, config_path in candidates:
+            if self._existing(model_path):
+                chosen_model = model_path
+                chosen_config = config_path if self._existing(config_path) else None
+                break
+
+        if not chosen_model:
+            raise FileNotFoundError(
+                "No Piper model found. Add model files under models/ and update PIPER_*_MODEL_PATH in config.py"
+            )
+
+        voice = PiperVoice.load(chosen_model, config_path=chosen_config)
+        return voice, chosen_model, chosen_config
+
+    def _warmup(self):
+        try:
+            # Consume the generator to warm up the model
+            list(self.voice.synthesize(self.piper_warmup_text))
+        except Exception:
+            pass
 
     def _reset_stream_stats(self):
         with self._stats_lock:
@@ -183,172 +192,59 @@ class TTS:
         with self._stats_lock:
             return dict(self._stream_stats) if self._stream_stats else {}
 
-    def _ensure_loop(self):
-        if self._loop is not None:
-            return
-
-        def run_loop():
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            self._loop.run_forever()
-
-        thread = threading.Thread(target=run_loop, daemon=True, name="TTS-Loop")
-        thread.start()
-
-        while self._loop is None:
-            time.sleep(0.01)
-
-    async def _do_edge_synth(self, seq: int, text: str) -> OrderedChunk:
-        try:
-            buf = io.BytesIO()
-            comm = edge_tts.Communicate(text, self.voice)
-            async for chunk in comm.stream():
-                if chunk["type"] == "audio":
-                    buf.write(chunk["data"])
-
-            buf.seek(0)
-            data, sr = sf.read(buf, dtype="float32")
-            if len(data.shape) > 1:
-                data = data.mean(axis=1)
-
-            return OrderedChunk(
-                sequence=seq,
-                audio_data=data,
-                sample_rate=sr,
-                text=text,
-                backend="edge",
-            )
-        except Exception as exc:
-            return OrderedChunk(sequence=seq, error=str(exc), text=text, backend="edge")
-
-    def _do_piper_synth(self, seq: int, text: str) -> OrderedChunk:
-        if not self._piper_available:
-            return OrderedChunk(
-                sequence=seq,
-                error="Piper is not available. Configure PIPER_EXECUTABLE and PIPER_MODEL_PATH.",
-                text=text,
-                backend="piper",
-            )
-
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        temp_file.close()
-
-        cmd = [
-            self.piper_executable,
-            "--model",
-            self.piper_model,
-            "--output_file",
-            temp_file.name,
-        ]
-        if self.piper_config:
-            cmd.extend(["--config", self.piper_config])
-
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=text,
-                text=True,
-                capture_output=True,
-                timeout=self.synth_timeout_s,
-                check=False,
-            )
-
-            if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or "piper synthesis failed").strip()
-                return OrderedChunk(sequence=seq, error=err, text=text, backend="piper")
-
-            data, sr = sf.read(temp_file.name, dtype="float32")
-            if len(data.shape) > 1:
-                data = data.mean(axis=1)
-
-            return OrderedChunk(
-                sequence=seq,
-                audio_data=data,
-                sample_rate=sr,
-                text=text,
-                backend="piper",
-            )
-        except Exception as exc:
-            return OrderedChunk(sequence=seq, error=str(exc), text=text, backend="piper")
-        finally:
-            if os.path.exists(temp_file.name):
-                os.remove(temp_file.name)
-
-    def _synth_one(self, seq: int, text: str) -> OrderedChunk:
+    def _synth_one(self, seq: int, text: str, emotion: str = "neutral") -> OrderedChunk:
         start = time.perf_counter()
-        chosen = self._choose_backend()
+        try:
+            # Get emotion-specific synthesis config
+            syn_config = EMOTION_PRESETS.get(emotion, EMOTION_PRESETS["neutral"])
 
-        if chosen == "piper":
-            result = self._do_piper_synth(seq, text)
-            if result.error and self.fallback_to_cloud and self.cloud_enabled:
-                self._ensure_loop()
-                future = asyncio.run_coroutine_threadsafe(
-                    self._do_edge_synth(seq, text),
-                    self._loop,
-                )
-                result = future.result(timeout=self.synth_timeout_s)
-        elif chosen == "edge":
-            self._ensure_loop()
-            future = asyncio.run_coroutine_threadsafe(
-                self._do_edge_synth(seq, text),
-                self._loop,
-            )
-            result = future.result(timeout=self.synth_timeout_s)
-        else:
+            # synthesize yields AudioChunk objects
+            audio_chunks = []
+            sample_rate = self.voice.config.sample_rate
+            for chunk in self.voice.synthesize(text, syn_config=syn_config):
+                audio_chunks.append(chunk.audio_float_array)
+                sample_rate = chunk.sample_rate
+
+            if audio_chunks:
+                audio = np.concatenate(audio_chunks)
+            else:
+                audio = np.array([], dtype=np.float32)
+
             result = OrderedChunk(
                 sequence=seq,
-                error="No TTS backend available. Check TTS_MODE/local/cloud config.",
+                audio_data=audio,
+                sample_rate=int(sample_rate),
                 text=text,
-                backend="none",
+                backend="piper",
+                emotion=emotion,
             )
+        except Exception as exc:
+            result = OrderedChunk(sequence=seq, error=str(exc), text=text, backend="piper", emotion=emotion)
 
         result.synth_ms = (time.perf_counter() - start) * 1000
         if result.error:
             if self._latency_logs:
-                print(f"[TTS Error:{result.backend or chosen}] {result.error}")
+                print(f"[TTS Error:{result.backend}] {result.error}")
         else:
-            self._mark_synth_done(result.synth_ms, result.backend or chosen)
+            self._mark_synth_done(result.synth_ms, result.backend)
+            if self._latency_logs and emotion != "neutral":
+                print(f"[TTS] emotion={emotion} length_scale={syn_config.length_scale:.2f} noise={syn_config.noise_scale:.2f}")
 
         return result
 
     def _synth_loop(self):
-        executor = ThreadPoolExecutor(max_workers=self._num_workers)
-        pending = []
-
         while not self._stop.is_set():
             try:
                 item = self._text_queue.get(timeout=0.1)
             except queue.Empty:
-                done = [f for f in pending if f.done()]
-                for future in done:
-                    pending.remove(future)
-                    try:
-                        self._audio_queue.put(future.result())
-                    except Exception:
-                        pass
                 continue
 
             if item is None:
-                for future in pending:
-                    try:
-                        self._audio_queue.put(future.result(timeout=self.synth_timeout_s))
-                    except Exception:
-                        pass
                 self._audio_queue.put(END_SENTINEL)
                 break
 
-            seq, text = item
-            pending.append(executor.submit(self._synth_one, seq, text))
-
-            done = [f for f in pending if f.done()]
-            for future in done:
-                pending.remove(future)
-                try:
-                    self._audio_queue.put(future.result())
-                except Exception:
-                    pass
-
-        executor.shutdown(wait=False)
+            seq, text, emotion = item
+            self._audio_queue.put(self._synth_one(seq, text, emotion))
 
     def _player_loop(self):
         expected_seq = 0
@@ -374,6 +270,7 @@ class TTS:
                 play_chunk = pending.pop(expected_seq)
                 if play_chunk.audio_data is not None:
                     self._mark_play_start()
+                    sd.stop()  # Ensure previous audio is stopped
                     sd.play(play_chunk.audio_data, samplerate=play_chunk.sample_rate)
                     sd.wait()
                     self._mark_play_done()
@@ -386,6 +283,7 @@ class TTS:
         if self._synth_thread is None or not self._synth_thread.is_alive():
             self._stop.clear()
             self._next_sequence = 0
+            self._last_queued_text = ""
             self._text_queue = queue.Queue()
             self._audio_queue = queue.PriorityQueue()
             self._reset_stream_stats()
@@ -400,12 +298,19 @@ class TTS:
         if not text or not text.strip():
             return
 
+        normalized = " ".join(text.strip().split())
+        if normalized == self._last_queued_text:
+            if self._latency_logs:
+                print(f"[TTS] skipped duplicate chunk: {normalized[:80]}")
+            return
+
         with self._lock:
             seq = self._next_sequence
             self._next_sequence += 1
+            self._last_queued_text = normalized
 
         self._mark_queued()
-        self._text_queue.put((seq, text.strip()))
+        self._text_queue.put((seq, normalized, emotion))
 
     def finish_streaming(self, timeout: float = 60.0):
         self._text_queue.put(None)
@@ -447,5 +352,8 @@ class TTS:
 
     def shutdown(self):
         self._stop.set()
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._synth_thread and self._synth_thread.is_alive():
+            self._text_queue.put(None)
+            self._synth_thread.join(timeout=1.0)
+        if self._player_thread and self._player_thread.is_alive():
+            self._player_thread.join(timeout=1.0)

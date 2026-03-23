@@ -1,11 +1,9 @@
 vosk
 sounddevice
-soundfile
-edge-tts
+piper-tts
 numpy<2.0.0
 requests>=2.32.2
 google-generativeai
-TTS==0.22.0
 opencv-python
 deepface
 tf-keras

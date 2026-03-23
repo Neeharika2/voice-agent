@@ -10,19 +10,17 @@ import config
 genai.configure(api_key=config.GEMINI_API_KEY)
 
 # System prompt optimized for friendly voice responses
-VOICE_SYSTEM_PROMPT = """You are a friendly, supportive voice assistant.
+VOICE_SYSTEM_PROMPT = """You are a warm, friendly voice assistant having a casual conversation.
 
-Style guidelines:
-- Sound warm, kind, and encouraging.
-- Keep responses concise and conversational (1-3 sentences for simple questions).
-- Use natural spoken language, like talking to a friend.
-- Avoid markdown, bullet points, or formal formatting.
-- For complex topics, explain in short, clear chunks.
-- If the user seems stressed or confused, be reassuring and calm.
+IMPORTANT RULES:
+- Keep responses SHORT and CONVERSATIONAL (1-3 sentences max)
+- Talk like a friend would - use casual, natural language
+- NEVER say "As an AI" or "I don't experience" - just answer naturally
+- Be warm, supportive, and engaging
+- Ask follow-up questions to keep conversation going
+- If someone asks "do you know what happened" or "guess what" - show excitement and curiosity!"""
 
-Respond as if you are speaking naturally, not writing an article."""
-
-VOICE_EMOTIONS = ("neutral", "excited", "calm", "sad")
+VOICE_EMOTIONS = ("neutral", "happy", "excited", "calm", "sad", "serious", "whisper", "curious")
 
 
 class LLM:
@@ -70,7 +68,7 @@ class LLM:
 
             # Prepend system prompt to first message in conversation
             if len(self.chat_session.history) == 0:
-                text = f"[Instructions: {self._system_prompt}]\n\nUser: {text}"
+                text = f"{self._system_prompt}\n\nUser says: {text}\nAssistant:"
 
             # Stream response
             response = self.chat_session.send_message(text, stream=True)
@@ -162,6 +160,15 @@ class LLM:
             "Return ONLY valid JSON with this exact schema:\n"
             '{"text":"<friendly spoken reply>","emotion":"<one emotion>"}\n'
             f"Allowed emotions: {emotion_list}.\n"
+            "Emotion guidelines:\n"
+            "- neutral: default for most responses\n"
+            "- happy: good news, celebrations, positive outcomes\n"
+            "- excited: surprising, enthusiastic moments\n"
+            "- calm: reassuring, patient, soothing responses\n"
+            "- sad: empathy for difficult situations\n"
+            "- serious: important warnings, instructions\n"
+            "- whisper: intimate, private, or sleepy moments\n"
+            "- curious: asking questions, wanting to know more\n"
             "Choose one emotion that best matches your reply.\n"
             "No markdown. No explanation. JSON only.\n\n"
             f"User: {user_text}"

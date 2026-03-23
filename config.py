@@ -16,24 +16,24 @@ STT_SILENCE_TIMEOUT = 0.5  # Seconds of silence before finalizing (reduced for f
 # For sub-100ms latency, use the small model: vosk-model-small-en-us-0.15 (~50MB)
 # Download from: https://alphacephei.com/vosk/models
 
-# TTS Settings
-# Modes: fast/auto (prefer local), local (Piper only), quality/cloud (Edge only)
-TTS_MODE = "fast"
-TTS_LOCAL_ENABLED = True
-TTS_CLOUD_ENABLED = True
-TTS_FALLBACK_TO_CLOUD = True
+# TTS Settings (Piper only)
 TTS_SYNTH_TIMEOUT_S = 20.0
 
-# Edge TTS (cloud quality)
-EDGE_TTS_VOICE = "en-IN-NeerjaNeural"
-# Other voices: en-US-JennyNeural, en-US-GuyNeural, en-GB-SoniaNeural
+# Preferred: English model
+PIPER_PRIMARY_MODEL_PATH = os.path.join(BASE_DIR, "models", "en_US-lessac-medium.onnx")
+PIPER_PRIMARY_CONFIG_PATH = os.path.join(BASE_DIR, "models", "en_US-lessac-medium.onnx.json")
 
-# Piper local (fast mode) - set both to enable local synthesis
-PIPER_EXECUTABLE = "piper"
-PIPER_MODEL_PATH = None  # Example: r"C:\\models\\en_US-lessac-medium.onnx"
-PIPER_MODEL_CONFIG_PATH = None  # Optional config json path
+# Fallback: Hindi model for Indian-native feel
+PIPER_FALLBACK_MODEL_PATH = os.path.join(BASE_DIR, "models", "hi_IN-rohan-medium.onnx")
+PIPER_FALLBACK_CONFIG_PATH = os.path.join(BASE_DIR, "models", "hi_IN-rohan-medium.onnx.json")
 
-TTS_PARALLEL_WORKERS = 3  # Concurrent synthesis threads
+# Backward-compatible aliases (used by older code paths)
+PIPER_MODEL_PATH = PIPER_PRIMARY_MODEL_PATH
+PIPER_MODEL_CONFIG_PATH = PIPER_PRIMARY_CONFIG_PATH
+
+PIPER_WARMUP_TEXT = "hi"
+PIPER_SPEAKER_ID = None
+
 TTS_STREAM_MIN_CHARS = 20  # Lower -> earlier first audio, higher -> smoother chunks
 TTS_STREAM_MAX_CHARS = 90  # Force flush if no punctuation appears
 
